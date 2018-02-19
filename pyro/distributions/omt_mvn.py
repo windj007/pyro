@@ -44,7 +44,7 @@ class _OMTMVNSample(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        jitter = 1.0e-12  # do i really need this?
+        jitter = 1.0e-8  # do i really need this?
         L, = ctx.saved_tensors
         z = ctx.z
         epsilon = ctx.white
@@ -58,29 +58,25 @@ class _OMTMVNSample(Function):
 
         z_ja = z.unsqueeze(-1)
         g_R_inv = torch.matmul(g, R_inv).unsqueeze(-2)
-        diff_L_ab = 0.5 * sum_leftmost(g_R_inv * z_ja, -2)
-
         epsilon_jb = epsilon.unsqueeze(-2)
         g_ja = g.unsqueeze(-1)
-        diff_L_ab += 0.5 * sum_leftmost(g_ja * epsilon_jb, -2)
+        diff_L_ab = 0.5 * sum_leftmost(g_ja * epsilon_jb + g_R_inv * z_ja, -2)
 
         Sigma_inv = torch.mm(R_inv, R_inv.t())
-        V, D, Vt = torch.svd(Sigma_inv + jitter)
-        D_outer = D.unsqueeze(-1) + D.unsqueeze(0) + jitter
+        V, D, _ = torch.svd(Sigma_inv + jitter)
+        Vt = V.t()
+        D_outer = D.unsqueeze(-1) + D.unsqueeze(0)
 
-        # XXX can i do this expansion more cleanly?
-        jdim = z.dim() - 1
-        expand_tuple = tuple([-1]*jdim + [dim, dim])
+        expand_tuple = tuple([-1] * (z.dim() - 1) + [dim, dim])
         z_tilde = identity * torch.matmul(z, V).unsqueeze(-1).expand(*expand_tuple)
         g_tilde = identity * torch.matmul(g, V).unsqueeze(-1).expand(*expand_tuple)
 
-        Y = torch.matmul(z_tilde, torch.matmul(1.0 / D_outer, g_tilde))
-        Y_tilde = torch.matmul(V, torch.matmul(Y, Vt))
-        Y_tilde_symm = Y_tilde + torch.transpose(Y_tilde, -1, -2)
+        Y = sum_leftmost(torch.matmul(z_tilde, torch.matmul(1.0 / D_outer, g_tilde)), -2)
+        Y = torch.mm(V, torch.mm(Y, Vt))
+        Y = Y + Y.t()
 
-        Tr_xi_Y = torch.matmul(torch.matmul(Sigma_inv, Y_tilde_symm), R_inv)
-        Tr_xi_Y -= torch.matmul(Y_tilde_symm, torch.mm(Sigma_inv, R_inv))
-        diff_L_ab += 0.5 * sum_leftmost(Tr_xi_Y, -2)
+        Tr_xi_Y = torch.mm(torch.mm(Sigma_inv, Y), R_inv) - torch.mm(Y, torch.mm(Sigma_inv, R_inv))
+        diff_L_ab += 0.5 * Tr_xi_Y
         L_grad = torch.tril(diff_L_ab)
 
         return loc_grad, L_grad, None
@@ -101,7 +97,7 @@ class OTCVMultivariateNormal(MultivariateNormal):
     """
     params = {"loc": constraints.real, "scale_tril": constraints.lower_triangular}
 
-    def __init__(self, loc, scale_tril, B=None, C=None, D=None, F=None):
+    def __init__(self, loc, scale_tril, B=None, C=None, D=None, F=None, lr=0.01):
         assert(loc.dim() == 1), "OMTMultivariateNormal loc must be 1-dimensional"
         assert(scale_tril.dim() == 2), "OMTMultivariateNormal scale_tril must be 2-dimensional"
         covariance_matrix = torch.mm(scale_tril, scale_tril.t())
@@ -111,6 +107,7 @@ class OTCVMultivariateNormal(MultivariateNormal):
         self.C = C
         self.D = D
         self.F = F
+        self.lr = lr
         BC_mode = (B is not None) and (C is not None)
         DF_mode = (D is not None) and (F is not None)
         if BC_mode:
@@ -121,22 +118,24 @@ class OTCVMultivariateNormal(MultivariateNormal):
 
     def rsample(self, sample_shape=torch.Size()):
         return _OTCVMVNSample.apply(self.loc, self.scale_tril, self.B, self.C, self.D, self.F,
-                                    sample_shape + self.loc.shape)
+                                    sample_shape + self.loc.shape, self.lr)
 
 
 class _OTCVMVNSample(Function):
     @staticmethod
-    def forward(ctx, loc, scale_tril, B, C, D, F, shape):
+    def forward(ctx, loc, scale_tril, B, C, D, F, shape, lr):
         ctx.save_for_backward(scale_tril)
         ctx.white = loc.new(shape).normal_()
         ctx.z = torch.matmul(ctx.white, scale_tril.t())
         ctx.B, ctx.C = B, C
         ctx.D, ctx.F = D, F
+        ctx.lr = lr
         return loc + ctx.z
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
+        lr = ctx.lr
         L, = ctx.saved_tensors
         z = ctx.z
         epsilon = ctx.white
@@ -154,7 +153,7 @@ class _OTCVMVNSample(Function):
         g_ja = g.unsqueeze(-1)
         diff_L_ab = sum_leftmost(g_ja * epsilon_jb, -2)
 
-        # modulate the velocity field with an infinitessimal rotation
+        # modulate the velocity fields with infinitessimal rotations
         if BC_mode:
             LB = torch.mm(L, B)
             eps_C = torch.matmul(epsilon, C)
@@ -165,7 +164,7 @@ class _OTCVMVNSample(Function):
             g_LC = torch.matmul(g, LC)
             diff_L_ab -= sum_leftmost(eps_B.unsqueeze(-1) * g_LC.unsqueeze(-2), -2)
 
-        # modulate the velocity field with an infinitessimal rotation
+        # modulate the velocity fields with infinitessimal rotations
         if DF_mode:
             LD = torch.mm(L, D)
             g_LD = torch.matmul(g, LD)
@@ -174,4 +173,21 @@ class _OTCVMVNSample(Function):
 
         L_grad = torch.tril(diff_L_ab)
 
-        return loc_grad, L_grad, None, None, None, None, None
+        # adapt B and C
+        if BC_mode:
+            g_L_kx = torch.matmul(g, L).unsqueeze(-1)
+            dL_C_eps_ky = torch.matmul(eps_C, L_grad.t()).unsqueeze(-2)
+            dB_xy = 2.0 * sum_leftmost(g_L_kx * dL_C_eps_ky, -2)
+            g_LC_y = torch.matmul(torch.matmul(g, LC), L_grad.t()).unsqueeze(-2)
+            eps_x = epsilon.unsqueeze(-1)
+            dB_xy -= 2.0 * sum_leftmost(g_LC_y * eps_x, -2)
+
+            g_LB_y = torch.matmul(g, torch.mm(LB, L_grad)).unsqueeze(-2)
+            dC_xy = 2.0 * sum_leftmost(g_LB_y * eps_x, -2)
+            eps_BLg_y = torch.matmul(epsilon, torch.mm(B, L_grad)).unsqueeze(-2)
+            dC_xy -= 2.0 * sum_leftmost(eps_BLg_y * g_L_kx, -2)
+
+            B -= lr * dB_xy
+            C -= lr * dC_xy
+
+        return loc_grad, L_grad, None, None, None, None, None, None
