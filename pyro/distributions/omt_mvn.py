@@ -96,6 +96,91 @@ class OTCVMultivariateNormal(MultivariateNormal):
     """
     params = {"loc": constraints.real, "scale_tril": constraints.lower_triangular}
 
+    def __init__(self, loc, scale_tril, CV=None):
+        assert(loc.dim() == 1), "OMTMultivariateNormal loc must be 1-dimensional"
+        assert(scale_tril.dim() == 2), "OMTMultivariateNormal scale_tril must be 2-dimensional"
+        covariance_matrix = torch.mm(scale_tril, scale_tril.t())
+        super(OTCVMultivariateNormal, self).__init__(loc, covariance_matrix)
+        self.scale_tril = scale_tril
+        self.CV = CV
+        assert(CV.size() == torch.Size([2, loc.size(0), loc.size(0)]))
+
+    def rsample(self, sample_shape=torch.Size()):
+        return _OTCVMVNSample.apply(self.loc, self.scale_tril, self.CV, sample_shape + self.loc.shape)
+
+
+class _OTCVMVNSample(Function):
+    @staticmethod
+    def forward(ctx, loc, scale_tril, CV, shape):
+        ctx.save_for_backward(scale_tril)
+        ctx.white = loc.new(shape).normal_()
+        ctx.z = torch.matmul(ctx.white, scale_tril.t())
+        ctx.CV = CV
+        return loc + ctx.z
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        lr = ctx.lr
+        L, = ctx.saved_tensors
+        z = ctx.z
+        epsilon = ctx.white
+        B, C = ctx.CV
+
+        dim = L.size(0)
+        g = grad_output
+        loc_grad = sum_leftmost(grad_output, -1)
+
+        # compute the rep trick gradient
+        epsilon_jb = epsilon.unsqueeze(-2)
+        g_ja = g.unsqueeze(-1)
+        diff_L_ab = sum_leftmost(g_ja * epsilon_jb, -2)
+
+        # modulate the velocity fields with infinitessimal rotations, i.e. apply the control variate
+            LB = torch.mm(L, B)
+            eps_C = torch.matmul(epsilon, C)
+            g_LB = torch.matmul(g, LB)
+            diff_L_ab += sum_leftmost(eps_C.unsqueeze(-2) * g_LB.unsqueeze(-1), -2)
+            LC = torch.mm(L, C)
+            eps_B = torch.matmul(epsilon, B)
+            g_LC = torch.matmul(g, LC)
+            diff_L_ab -= sum_leftmost(eps_B.unsqueeze(-1) * g_LC.unsqueeze(-2), -2)
+
+        L_grad = torch.tril(diff_L_ab)
+
+        # adapt B and C
+        if BC_mode:
+            g_L_kx = torch.matmul(g, L).unsqueeze(-1)
+            dL_C_eps_ky = torch.matmul(eps_C, L_grad.t()).unsqueeze(-2)
+            dB_xy = 2.0 * sum_leftmost(g_L_kx * dL_C_eps_ky, -2)
+            g_LC_y = torch.matmul(torch.matmul(g, LC), L_grad.t()).unsqueeze(-2)
+            eps_x = epsilon.unsqueeze(-1)
+            dB_xy -= 2.0 * sum_leftmost(g_LC_y * eps_x, -2)
+
+            g_LB_y = torch.matmul(g, torch.mm(LB, L_grad)).unsqueeze(-2)
+            dC_xy = 2.0 * sum_leftmost(g_LB_y * eps_x, -2)
+            eps_BLg_y = torch.matmul(epsilon, torch.mm(B, L_grad)).unsqueeze(-2)
+            dC_xy -= 2.0 * sum_leftmost(eps_BLg_y * g_L_kx, -2)
+
+
+        return loc_grad, L_grad, dB_xy, dC_xy, None, None, None, None
+
+
+class OldOTCVMultivariateNormal(MultivariateNormal):
+    """Multivariate normal (Gaussian) distribution with optimal transport-inspired control variates.
+
+    A distribution over vectors in which all the elements have a joint Gaussian
+    density.
+
+    :param torch.autograd.Variable loc: Mean.
+    :param torch.autograd.Variable scale_tril: Cholesky of Covariance matrix.
+    :param torch.autograd.Variable B: tensor controlling the control variate
+    :param torch.autograd.Variable C: tensor controlling the control variate
+    :param torch.autograd.Variable D: tensor controlling the control variate
+    :param torch.autograd.Variable F: tensor controlling the control variate
+    """
+    params = {"loc": constraints.real, "scale_tril": constraints.lower_triangular}
+
     def __init__(self, loc, scale_tril, B=None, C=None, D=None, F=None, lr=0.01):
         assert(loc.dim() == 1), "OMTMultivariateNormal loc must be 1-dimensional"
         assert(scale_tril.dim() == 2), "OMTMultivariateNormal scale_tril must be 2-dimensional"
@@ -116,11 +201,11 @@ class OTCVMultivariateNormal(MultivariateNormal):
         assert (BC_mode or DF_mode), "Must use at least one control variate parameterization"
 
     def rsample(self, sample_shape=torch.Size()):
-        return _OTCVMVNSample.apply(self.loc, self.scale_tril, self.B, self.C, self.D, self.F,
+        return _OldOTCVMVNSample.apply(self.loc, self.scale_tril, self.B, self.C, self.D, self.F,
                                     sample_shape + self.loc.shape, self.lr)
 
 
-class _OTCVMVNSample(Function):
+class _OldOTCVMVNSample(Function):
     @staticmethod
     def forward(ctx, loc, scale_tril, B, C, D, F, shape, lr):
         ctx.save_for_backward(scale_tril)
