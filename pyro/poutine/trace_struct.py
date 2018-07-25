@@ -215,7 +215,7 @@ class Trace(object):
         :returns: total log probability.
         :rtype: torch.Tensor
         """
-        log_p = 0.0
+        log_p = None
         for name, site in self.nodes.items():
             if site["type"] == "sample" and site_filter(name, site):
                 try:
@@ -228,8 +228,11 @@ class Trace(object):
                     if is_validation_enabled():
                         warn_if_nan(site_log_p, "log_prob_sum at site '{}'".format(name))
                         warn_if_inf(site_log_p, "log_prob_sum at site '{}'".format(name), allow_neginf=True)
-                log_p += site_log_p
-        return log_p
+                if log_p is None:
+                    log_p = site_log_p
+                else:
+                    log_p = log_p + site_log_p
+        return log_p if log_p else 0.0
 
     def compute_log_prob(self, site_filter=lambda name, site: True):
         """
